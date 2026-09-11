@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Overseer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1116; --panel: #161b22; --line: #262d36;
+    --fg: #e6edf3; --dim: #8b949e;
+    --run: #3fb950; --stall: #d29922; --fail: #f85149; --ok: #58a6ff; --cancel: #8b949e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+           padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .spacer { flex: 1; }
+  .stat { font-size: 12px; color: var(--dim); white-space: nowrap; }
+  .stat b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #conn { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); }
+  #conn.up { color: var(--run); border-color: #1d4429; }
+  #conn.down { color: var(--fail); border-color: #4c1f1c; }
+  input { background: var(--bg); border: 1px solid var(--line); color: var(--fg);
+          border-radius: 6px; padding: 5px 9px; font: inherit; font-size: 12px; width: 150px; }
+
+  main { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; height: calc(100vh - 53px); }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } }
+
+  #runs { overflow-y: auto; border-right: 1px solid var(--line); }
+  .run { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .run:hover { background: #1b2129; }
+  .run.sel { background: #1f2630; box-shadow: inset 3px 0 0 var(--ok); }
+  .run-top { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.running { background: var(--run); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.stalled { background: var(--stall); } .dot.failed { background: var(--fail); }
+  .dot.ok { background: var(--ok); } .dot.cancelled { background: var(--cancel); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kind { font-size: 10px; color: var(--dim); border: 1px solid var(--line);
+          padding: 0 5px; border-radius: 4px; flex: none; }
+  .run-sub { font-size: 12px; color: var(--dim); margin-top: 3px;
+             font-variant-numeric: tabular-nums; }
+
+  #detail { overflow-y: auto; padding: 18px 22px; }
+  .empty { color: var(--dim); text-align: center; margin-top: 18vh; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 10px 0 18px;
+          font-size: 12px; color: var(--dim); }
+  .meta b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  pre.err { background: #2d1517; border: 1px solid #4c1f1c; border-radius: 6px;
+            padding: 10px; overflow-x: auto; font: 12px/1.5 var(--mono); color: #ffa198; }
+
+  .ev { display: grid; grid-template-columns: 70px 90px 1fr auto; gap: 12px;
+        padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px;
+        align-items: baseline; }
+  .ev time { color: var(--dim); font: 11px var(--mono); }
+  .tag { font: 10px var(--mono); text-transform: uppercase; letter-spacing: .5px;
+         color: var(--dim); }
+  .tag.llm { color: #bc8cff } .tag.tool { color: #58a6ff }
+  .tag.step { color: #3fb950 } .tag.stall, .tag.error { color: var(--fail) }
+  .msg { overflow-wrap: anywhere; }
+  .ev.lvl-error .msg { color: #ffa198; }
+  .ev .dur { color: var(--dim); font: 11px var(--mono); white-space: nowrap; }
+  .depth { color: var(--dim); }
+  h2 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 9px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Overseer</h1>
+  <span id="conn" class="down">connecting</span>
+  <span class="stat"><b id="s-live">0</b> live</span>
+  <span class="stat"><b id="s-runs">0</b> runs/24h</span>
+  <span class="stat"><b id="s-tok">0</b> tokens</span>
+  <span class="stat">$<b id="s-cost">0.00</b></span>
+  <span class="spacer"></span>
+  <input id="token" type="password" placeholder="token (if set)" autocomplete="off">
+</header>
+<main>
+  <div id="runs"></div>
+  <div id="detail"><div class="empty">Select a run to see its timeline.</div></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const runs = new Map();          // run_id -> run
+const events = new Map();        // run_id -> [event]
+let selected = null, cursor = 0, es = null;
+
+const token = { get: () => localStorage.getItem('overseer_token') || '',
+                set: (v) => localStorage.setItem('overseer_token', v) };
+$('token').value = token.get();
+$('token').addEventListener('change', (e) => { token.set(e.target.value.trim()); location.reload(); });
+
+const auth = () => token.get() ? { Authorization: 'Bearer ' + token.get() } : {};
+const api = (path) => fetch(path, { headers: auth() }).then((r) => {
+  if (r.status === 401) { $('conn').textContent = 'unauthorized'; throw new Error('unauthorized'); }
+  return r.json();
+});
+
+// ---------- formatting
+const pad = (n) => String(n).padStart(2, '0');
+function dur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm' + pad(sec % 60) + 's';
+  return Math.floor(sec / 3600) + 'h' + pad(Math.floor(sec % 3600 / 60)) + 'm';
+}
+function clock(ts) {
+  const d = new Date(ts * 1000);
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+const num = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M'
+                 : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// ---------- rendering
+function runElapsed(r) {
+  return (r.ended_at || Date.now() / 1000) - r.started_at;
+}
+function renderRuns() {
+  const order = { running: 0, stalled: 1, failed: 2, cancelled: 3, ok: 4 };
+  const list = [...runs.values()].sort((a, b) =>
+    (order[a.status] - order[b.status]) || (b.started_at - a.started_at));
+  $('runs').innerHTML = list.map((r) => `
+    <div class="run ${r.id === selected ? 'sel' : ''}" data-id="${esc(r.id)}">
+      <div class="run-top">
+        <span class="dot ${esc(r.status)}"></span>
+        <span class="name">${esc(r.agent)}</span>
+        <span class="kind">${esc(r.kind)}</span>
+      </div>
+      <div class="run-sub">${esc(r.status)} &middot; ${dur(runElapsed(r))}
+        ${r.tokens_in + r.tokens_out ? ' &middot; ' + num(r.tokens_in + r.tokens_out) + ' tok' : ''}
+        ${r.cost_usd ? ' &middot; $' + r.cost_usd.toFixed(4) : ''}</div>
+    </div>`).join('') || '<div class="empty">No runs yet.</div>';
+}
+$('runs').addEventListener('click', (e) => {
+  const el = e.target.closest('.run');
+  if (el) select(el.dataset.id);
+});
+
+function eventLine(ev) {
+  const p = ev.payload || {};
+  let msg = p.message || ev.name || ev.type;
+  if (ev.type === 'llm') {
+    msg = `${esc(ev.name)} &mdash; ${num(ev.tokens_in)} in / ${num(ev.tokens_out)} out`
+        + (ev.cost_usd ? ` &middot; $${ev.cost_usd.toFixed(4)}` : '');
+  } else if (ev.type === 'stall') {
+    msg = `no signal for ${dur(p.silent_for_seconds || 0)} &mdash; presumed stuck`;
+  } else if (ev.type === 'run.end') {
+    msg = `run ended: ${esc(runs.get(ev.run_id)?.status || '')}`;
+  } else {
+    msg = esc(msg);
+  }
+  const indent = ev.parent_id ? '<span class="depth">└ </span>' : '';
+  return `<div class="ev lvl-${esc(ev.level)}">
+    <time>${clock(ev.ts)}</time>
+    <span class="tag ${esc(ev.level === 'error' ? 'error' : ev.type)}">${esc(ev.type)}</span>
+    <span class="msg">${indent}${msg}</span>
+    <span class="dur">${ev.duration_ms ? Math.round(ev.duration_ms) + 'ms' : ''}</span>
+  </div>`;
+}
+
+function renderDetail() {
+  if (!selected || !runs.has(selected)) return;
+  const r = runs.get(selected);
+  const evs = events.get(selected) || [];
+  $('detail').innerHTML = `
+    <h2><span class="dot ${esc(r.status)}"></span>${esc(r.agent)}</h2>
+    <div class="meta">
+      <span>status <b>${esc(r.status)}</b></span>
+      <span>elapsed <b>${dur(runElapsed(r))}</b></span>
+      <span>tokens <b>${num(r.tokens_in)} / ${num(r.tokens_out)}</b></span>
+      <span>cost <b>$${(r.cost_usd || 0).toFixed(4)}</b></span>
+      <span>host <b>${esc(r.host || '?')}</b>${r.pid ? ' pid ' + r.pid : ''}</span>
+      <span>run <b>${esc(r.id.slice(0, 12))}</b></span>
+    </div>
+    ${r.error ? `<pre class="err">${esc(r.error)}</pre>` : ''}
+    ${Object.keys(r.meta || {}).length
+      ? `<div class="meta"><span>meta <b>${esc(JSON.stringify(r.meta))}</b></span></div>` : ''}
+    <div id="timeline">${evs.map(eventLine).join('')}</div>`;
+}
+
+async function select(id) {
+  selected = id;
+  renderRuns();
+  const full = await api('/v1/runs/' + encodeURIComponent(id));
+  runs.set(id, full);
+  events.set(id, full.events || []);
+  renderDetail();
+}
+
+// ---------- live stream
+function connect() {
+  const qs = token.get() ? '?token=' + encodeURIComponent(token.get()) + '&cursor=' + cursor
+                         : '?cursor=' + cursor;
+  es = new EventSource('/v1/stream' + qs);
+  es.addEventListener('open', () => { $('conn').className = 'up'; $('conn').textContent = 'live'; });
+  es.addEventListener('hello', (m) => { cursor = JSON.parse(m.data).cursor; });
+  es.addEventListener('run', (m) => {
+    const r = JSON.parse(m.data);
+    runs.set(r.id, { ...runs.get(r.id), ...r });
+    renderRuns();
+    if (r.id === selected) renderDetail();
+  });
+  es.addEventListener('event', (m) => {
+    const ev = JSON.parse(m.data);
+    cursor = Math.max(cursor, ev.id);
+    if (!events.has(ev.run_id)) events.set(ev.run_id, []);
+    const list = events.get(ev.run_id);
+    if (!list.some((e) => e.id === ev.id)) list.push(ev);
+    if (ev.run_id === selected) renderDetail();
+  });
+  es.addEventListener('error', () => {
+    $('conn').className = 'down'; $('conn').textContent = 'reconnecting';
+    // EventSource retries on its own; cursor ensures we replay the gap.
+  });
+}
+
+async function refresh() {
+  const [{ runs: list }, stats] = await Promise.all([api('/v1/runs'), api('/v1/stats')]);
+  list.forEach((r) => runs.set(r.id, { ...runs.get(r.id), ...r }));
+  $('s-live').textContent = stats.live;
+  $('s-runs').textContent = Object.values(stats.by_status).reduce((a, b) => a + b, 0);
+  $('s-tok').textContent = num(stats.tokens_in + stats.tokens_out);
+  $('s-cost').textContent = (stats.cost_usd || 0).toFixed(2);
+  renderRuns();
+}
+
+refresh().then(connect).catch(() => { $('conn').textContent = 'unauthorized'; });
+setInterval(refresh, 15000);          // stats + reconcile
+setInterval(() => { renderRuns(); if (selected) renderDetail(); }, 1000);  // tick elapsed
+</script>
+</body>
+</html>
